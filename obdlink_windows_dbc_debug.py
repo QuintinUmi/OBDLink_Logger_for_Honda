@@ -356,7 +356,7 @@ class SerialReaderThread(threading.Thread):
     to a queue. Parsing/decoding/logging are done in the main thread.
     """
 
-    def __init__(self, ser, line_queue, stop_event, stats, sleep_empty=0.0005):
+    def __init__(self, ser, line_queue, stop_event, stats, sleep_empty=0.0005, raw_bytes_file=None, raw_bytes_only=False):
         super().__init__(daemon=True)
 
         self.ser = ser
@@ -364,6 +364,8 @@ class SerialReaderThread(threading.Thread):
         self.stop_event = stop_event
         self.stats = stats
         self.sleep_empty = sleep_empty
+        self.raw_bytes_file = raw_bytes_file
+        self.raw_bytes_only = raw_bytes_only
         self.buf = ""
 
     def push_line_drop_oldest(self, item):
@@ -399,6 +401,16 @@ class SerialReaderThread(threading.Thread):
 
                 self.stats["serial_bytes"] += len(chunk)
 
+                if self.raw_bytes_file is not None:
+                    try:
+                        self.raw_bytes_file.write(chunk)
+                    except Exception as e:
+                        self.stats["reader_errors"] += 1
+                        self.stats["last_reader_error"] = f"raw_bytes_write: {e}"
+
+                if self.raw_bytes_only:
+                    continue
+
                 text = chunk.decode("ascii", errors="ignore")
                 text = text.replace("\r", "\n")
                 self.buf += text
@@ -421,7 +433,7 @@ class SerialReaderThread(threading.Thread):
                 self.stats["last_reader_error"] = str(e)
                 time.sleep(0.005)
 
-        if self.buf.strip():
+        if (not self.raw_bytes_only) and self.buf.strip():
             t_arrival = time.perf_counter()
             self.stats["serial_lines"] += 1
             self.stats["last_serial_line_time"] = t_arrival
@@ -1086,6 +1098,18 @@ def main():
     )
 
     parser.add_argument(
+        "--raw-only",
+        action="store_true",
+        help="Record raw CAN frames only (no decode/snapshot/selected output).",
+    )
+
+    parser.add_argument(
+        "--raw-bytes",
+        action="store_true",
+        help="Record raw serial bytes only (no parsing/decoding).",
+    )
+
+    parser.add_argument(
         "--stale-ms",
         type=float,
         default=1000.0,
@@ -1104,6 +1128,25 @@ def main():
 
     parser.set_defaults(show_all_signals=False, selected_all_signals=False)
     args = parser.parse_args()
+
+    if args.raw_bytes:
+        args.raw_only = True
+        args.no_raw_log = True
+        args.auto_restart_atma = False
+        print("[INFO] Raw-bytes mode: no parsing/decoding; auto-restart disabled.")
+
+    if args.raw_only:
+        # Prioritize raw capture throughput by disabling expensive work.
+        args.no_decoded_log = True
+        args.no_snapshot_log = True
+        args.no_selected_log = True
+        args.dump_decoded = False
+        args.dump_changed_only = False
+        args.show_all_signals = False
+        args.max_id_hz = 0.0
+        if args.queue_size < 10000:
+            args.queue_size = 10000
+        print("[INFO] Raw-only mode: decode/snapshot/selected outputs disabled.")
 
     if args.preset:
         preset_code, preset_mask = PRESETS[args.preset]
@@ -1161,6 +1204,7 @@ def main():
     decoded_path = logs_dir / f"decoded_async_{stamp}.csv"
     snapshot_path = logs_dir / f"snapshot_async_{stamp}.csv"
     selected_path = logs_dir / f"selected_async_{stamp}.csv"
+    raw_bytes_path = logs_dir / f"raw_serial_{stamp}.bin"
 
     print(f"[INFO] Opening {args.port} @ {args.baud}")
 
@@ -1169,6 +1213,7 @@ def main():
         args.baud,
         timeout=0,
         write_timeout=0.2,
+        rtscts=True,
     )
 
     stop_event = threading.Event()
@@ -1209,6 +1254,7 @@ def main():
     f_dec = None
     f_snap = None
     f_sel = None
+    f_raw_bytes = None
 
     raw_writer = None
     dec_writer = None
@@ -1270,12 +1316,18 @@ def main():
         ser.write(b"ATMA\r")
         ser.flush()
 
+        if args.raw_bytes:
+            f_raw_bytes = open(raw_bytes_path, "ab")
+            print(f"[INFO] Raw serial bytes: {raw_bytes_path}")
+
         reader = SerialReaderThread(
             ser=ser,
             line_queue=line_queue,
             stop_event=stop_event,
             stats=reader_stats,
             sleep_empty=0.0005,
+            raw_bytes_file=f_raw_bytes,
+            raw_bytes_only=args.raw_bytes,
         )
         reader.start()
 
@@ -1330,6 +1382,28 @@ def main():
         last_restart_attempt = 0.0
 
         try:
+            if args.raw_bytes:
+                last_flush = 0.0
+                while True:
+                    now_perf = time.perf_counter()
+                    elapsed = now_perf - t0_perf
+
+                    if args.duration > 0 and elapsed >= args.duration:
+                        print(f"[INFO] Time limit reached: {args.duration} seconds.")
+                        break
+
+                    if f_raw_bytes is not None and elapsed - last_flush >= 1.0:
+                        try:
+                            f_raw_bytes.flush()
+                        except Exception:
+                            pass
+                        last_flush = elapsed
+
+                    time.sleep(0.05)
+
+                stop_event.set()
+                return
+
             while True:
                 now_perf = time.perf_counter()
                 elapsed = now_perf - t0_perf
@@ -1462,8 +1536,8 @@ def main():
                         " ".join(f"{b:02X}" for b in data),
                     ])
 
-                # Decode if in DBC.
-                if can_id in id_to_msg:
+                # Decode if in DBC and not in raw-only mode.
+                if (not args.raw_only) and can_id in id_to_msg:
                     msg = id_to_msg[can_id]
 
                     if len(data) < msg.length:
@@ -1524,7 +1598,7 @@ def main():
                             fail_reason[can_id] = str(e)
 
                 # Selected signal output, also limited by accepted CAN ID rate.
-                if sel_writer is not None:
+                if (not args.raw_only) and sel_writer is not None:
                     sel_writer.writerow(
                         make_selected_row(
                             now_wall,
@@ -1539,7 +1613,7 @@ def main():
                     )
 
                 # Periodic snapshot.
-                if args.snapshot_every > 0 and (not args.no_snapshot_log) and snap_writer is not None:
+                if (not args.raw_only) and args.snapshot_every > 0 and (not args.no_snapshot_log) and snap_writer is not None:
                     if rel_t - last_snapshot >= args.snapshot_every:
                         snap_writer.writerow(
                             make_snapshot_row(
@@ -1553,7 +1627,7 @@ def main():
                         last_snapshot = rel_t
 
                 # Periodic dashboard.
-                if rel_t - last_print >= args.print_every:
+                if (not args.raw_only) and rel_t - last_print >= args.print_every:
                     print_dashboard(
                         rel_t,
                         last_values,
@@ -1610,7 +1684,7 @@ def main():
 
         print("[INFO] Closing log files...")
 
-        for f in [f_raw, f_dec, f_snap, f_sel]:
+        for f in [f_raw, f_dec, f_snap, f_sel, f_raw_bytes]:
             if f is not None:
                 try:
                     f.flush()
