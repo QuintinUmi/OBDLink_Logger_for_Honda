@@ -141,31 +141,19 @@ def load_dbc(dbc_path: Path):
         return cantools.database.load_string("\n".join(sanitized_lines), database_format="dbc", strict=False)
 
 
-def decode_stream(input_path: Path, raw_out: Path, decoded_out: Path, dbc_path: Path | None) -> int:
-    db = None
-    id_to_msg = {}
-    if dbc_path is not None:
-        if not dbc_path.exists():
-            print(f"[ERROR] DBC not found: {dbc_path}")
-            return 1
-        db = load_dbc(dbc_path)
-        id_to_msg = {m.frame_id: m for m in db.messages}
-        print(f"[INFO] Loaded DBC: {dbc_path} ({len(db.messages)} messages)")
+def iter_lines_with_ts(raw_lines_path: Path):
+    with raw_lines_path.open("r", encoding="utf-8", newline="") as f_in:
+        reader = csv.reader(f_in)
+        header = next(reader, None)
+        for row in reader:
+            if len(row) < 4:
+                continue
+            yield row[0], row[1], row[2], row[3]
 
-    with input_path.open("rb") as f_in, \
-            raw_out.open("w", newline="", encoding="utf-8") as f_raw, \
-            decoded_out.open("w", newline="", encoding="utf-8") as f_dec:
-        raw_writer = csv.writer(f_raw)
-        dec_writer = csv.writer(f_dec)
 
-        raw_writer.writerow(["line_index", "can_id", "dlc", "data_hex"])
-        dec_writer.writerow(["line_index", "can_id", "message", "signal", "value"])
-
+def iter_lines_from_bytes(input_path: Path):
+    with input_path.open("rb") as f_in:
         buf = ""
-        line_index = 0
-        raw_count = 0
-        dec_count = 0
-
         while True:
             chunk = f_in.read(65536)
             if not chunk:
@@ -180,44 +168,98 @@ def decode_stream(input_path: Path, raw_out: Path, decoded_out: Path, dbc_path: 
                 line = line.strip()
                 if not line:
                     continue
+                yield None, None, None, line
 
-                line_index += 1
-                parsed = parse_atma_line(line)
-                if parsed is None:
-                    continue
 
-                if parsed[0] in ("__PROMPT__", "__ADAPTER_STATUS__"):
-                    continue
+def decode_stream(
+    input_path: Path,
+    raw_out: Path,
+    decoded_out: Path,
+    dbc_path: Path | None,
+    raw_lines_path: Path | None,
+) -> int:
+    db = None
+    id_to_msg = {}
+    if dbc_path is not None:
+        if not dbc_path.exists():
+            print(f"[ERROR] DBC not found: {dbc_path}")
+            return 1
+        db = load_dbc(dbc_path)
+        id_to_msg = {m.frame_id: m for m in db.messages}
+        print(f"[INFO] Loaded DBC: {dbc_path} ({len(db.messages)} messages)")
 
-                can_id, data = parsed
-                raw_writer.writerow([line_index, f"0x{can_id:X}", len(data), data.hex().upper()])
-                raw_count += 1
+    with raw_out.open("w", newline="", encoding="utf-8") as f_raw, \
+            decoded_out.open("w", newline="", encoding="utf-8") as f_dec:
+        raw_writer = csv.writer(f_raw)
+        dec_writer = csv.writer(f_dec)
 
-                if db is None:
-                    continue
+        raw_writer.writerow(["time_wall", "time_perf", "rel_time", "line_index", "can_id", "dlc", "data_hex"])
+        dec_writer.writerow(["time_wall", "time_perf", "rel_time", "line_index", "can_id", "message", "signal", "value"])
 
-                msg = id_to_msg.get(can_id)
-                if msg is None:
-                    continue
+        line_index = 0
+        raw_count = 0
+        dec_count = 0
 
-                if len(data) < msg.length:
-                    data_decode = data + bytes(msg.length - len(data))
-                else:
-                    data_decode = data[:msg.length]
+        if raw_lines_path is not None:
+            line_iter = iter_lines_with_ts(raw_lines_path)
+        else:
+            line_iter = iter_lines_from_bytes(input_path)
 
-                try:
-                    decoded = db.decode_message(
-                        can_id,
-                        data_decode,
-                        decode_choices=False,
-                        scaling=True,
-                    )
-                except Exception:
-                    continue
+        for time_wall, time_perf, rel_time, line in line_iter:
+            line_index += 1
+            parsed = parse_atma_line(line)
+            if parsed is None:
+                continue
 
-                for sig, val in decoded.items():
-                    dec_writer.writerow([line_index, f"0x{can_id:X}", msg.name, sig, val])
-                    dec_count += 1
+            if parsed[0] in ("__PROMPT__", "__ADAPTER_STATUS__"):
+                continue
+
+            can_id, data = parsed
+            raw_writer.writerow([
+                time_wall or "",
+                time_perf or "",
+                rel_time or "",
+                line_index,
+                f"0x{can_id:X}",
+                len(data),
+                data.hex().upper(),
+            ])
+            raw_count += 1
+
+            if db is None:
+                continue
+
+            msg = id_to_msg.get(can_id)
+            if msg is None:
+                continue
+
+            if len(data) < msg.length:
+                data_decode = data + bytes(msg.length - len(data))
+            else:
+                data_decode = data[:msg.length]
+
+            try:
+                decoded = db.decode_message(
+                    can_id,
+                    data_decode,
+                    decode_choices=False,
+                    scaling=True,
+                )
+            except Exception:
+                continue
+
+            for sig, val in decoded.items():
+                dec_writer.writerow([
+                    time_wall or "",
+                    time_perf or "",
+                    rel_time or "",
+                    line_index,
+                    f"0x{can_id:X}",
+                    msg.name,
+                    sig,
+                    val,
+                ])
+                dec_count += 1
 
         print(f"[INFO] Raw frames: {raw_count}")
         print(f"[INFO] Decoded rows: {dec_count}")
@@ -231,13 +273,18 @@ def main() -> int:
     parser.add_argument("--dbc", type=Path, default=None, help="DBC file path for decoding")
     parser.add_argument("--raw-out", type=Path, default=Path("decoded_raw.csv"), help="Raw CSV output path")
     parser.add_argument("--decoded-out", type=Path, default=Path("decoded_signals.csv"), help="Decoded CSV output path")
+    parser.add_argument("--raw-lines", type=Path, default=None, help="Optional raw_lines_*.csv with timestamps")
     args = parser.parse_args()
 
     if not args.input.exists():
         print(f"[ERROR] Input not found: {args.input}")
         return 1
 
-    return decode_stream(args.input, args.raw_out, args.decoded_out, args.dbc)
+    if args.raw_lines is not None and not args.raw_lines.exists():
+        print(f"[ERROR] Raw lines file not found: {args.raw_lines}")
+        return 1
+
+    return decode_stream(args.input, args.raw_out, args.decoded_out, args.dbc, args.raw_lines)
 
 
 if __name__ == "__main__":
